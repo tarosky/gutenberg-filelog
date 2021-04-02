@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
@@ -13,14 +16,15 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	cwlogs "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	cwlt "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-)
-
-var (
-	log *zap.Logger
 )
 
 // This implements zapcore.WriteSyncer interface.
@@ -155,34 +159,78 @@ func setPIDFile(path string) func() {
 type AbsolutePath string
 
 func (p *AbsolutePath) UnmarshalJSON(data []byte) error {
-	var v []interface{}
-	if err := json.Unmarshal(data, &v); err != nil {
+	var path string
+	if err := json.Unmarshal(data, &path); err != nil {
 		return err
 	}
 
-	path, err := filepath.Abs(string(data))
+	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
 
-	*p = AbsolutePath(path)
+	*p = AbsolutePath(absPath)
 
 	return nil
 }
 
 type watch struct {
 	Directory AbsolutePath `json:"directory"`
-	Pattern   string       `json:"pattern"`
 	LogGroup  string       `json:"loggroup"`
+	LogStream string       `json:"logstream"`
 }
 
-type config struct {
+type configure struct {
 	Region       string       `json:"region"`
 	S3Bucket     string       `json:"s3bucket"`
+	S3KeyPrefix  string       `json:"s3keyprefix"`
 	LogPath      AbsolutePath `json:"logpath"`
 	ErrorLogPath AbsolutePath `json:"errorlogpath"`
 	PIDPath      AbsolutePath `json:"pidpath"`
 	Watches      []watch      `json:"watches"`
+}
+
+type environment struct {
+	configure
+	wMap         watchMap
+	awsConfig    *aws.Config
+	s3Client     *s3.Client
+	cwlogsClient *cwlogs.Client
+	log          *zap.Logger
+}
+
+func createAWSConfig(ctx context.Context, cfg *configure) *aws.Config {
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.Region))
+	if err != nil {
+		panic(err)
+	}
+
+	return &awsCfg
+}
+
+type watchMap map[AbsolutePath]*watch
+
+func newWatchMap() watchMap {
+	return (watchMap)(map[AbsolutePath]*watch{})
+}
+
+func (t watchMap) add(w *watch) error {
+	mt := (map[AbsolutePath]*watch)(t)
+
+	if _, ok := mt[w.Directory]; ok {
+		return errors.New("duplicate entry")
+	}
+	mt[w.Directory] = w
+
+	return nil
+}
+
+func (t watchMap) get(path string) (*watch, error) {
+	watch, ok := (map[AbsolutePath]*watch)(t)[(AbsolutePath)(filepath.Dir(path))]
+	if !ok {
+		return nil, errors.New("no entry exists")
+	}
+	return watch, nil
 }
 
 func main() {
@@ -200,6 +248,8 @@ func main() {
 	}
 
 	app.Action = func(c *cli.Context) error {
+		defer panic("debugging")
+
 		mustGetAbsPath := func(name string) string {
 			path, err := filepath.Abs(c.Path(name))
 			if err != nil {
@@ -222,19 +272,37 @@ func main() {
 			panic(err)
 		}
 
-		cfg := &config{}
+		cfg := &configure{}
 		if err := json.Unmarshal(configData, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "malformed config file: %s", err.Error())
 			panic(err)
 		}
 
-		log = createLogger(c.Context, cfg.LogPath, cfg.ErrorLogPath)
-		defer log.Sync()
+		ctx, cancel := context.WithCancel(c.Context)
+
+		awsConfig := createAWSConfig(ctx, cfg)
+
+		e := &environment{
+			configure:    *cfg,
+			awsConfig:    awsConfig,
+			s3Client:     s3.NewFromConfig(*awsConfig),
+			cwlogsClient: cwlogs.NewFromConfig(*awsConfig),
+			log:          createLogger(c.Context, cfg.LogPath, cfg.ErrorLogPath),
+		}
+		defer e.log.Sync()
+
+		wMap := newWatchMap()
+		for _, w := range cfg.Watches {
+			w := w
+			if err := wMap.add(&w); err != nil {
+				e.log.Panic("failed to add", zap.String("directory", string(w.Directory)))
+			}
+		}
+
+		e.wMap = wMap
 
 		removePIDFile := setPIDFile(string(cfg.PIDPath))
 		defer removePIDFile()
-
-		ctx, cancel := context.WithCancel(context.Background())
 
 		sig := make(chan os.Signal)
 		signal.Notify(sig, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGQUIT)
@@ -248,9 +316,7 @@ func main() {
 			cancel()
 		}()
 
-		watchLogs(ctx, cfg)
-
-		return nil
+		return watchLogs(ctx, e)
 	}
 
 	err := app.Run(os.Args)
@@ -259,32 +325,114 @@ func main() {
 	}
 }
 
-func watchLog(ctx context.Context, w watch) error {
-	watcher, err := fsnotify.NewWatcher()
+func generateKey(e *environment, name string) (string, error) {
+	fileName := filepath.Base(name)
+
+	var bs [32]byte
+	_, err := rand.Read(bs[:])
 	if err != nil {
-		log.Error("failed to watch", zap.Error(err))
+		return "", err
+	}
+	dir := hex.EncodeToString(bs[:])
+
+	return e.S3KeyPrefix + dir + "/" + fileName, nil
+}
+
+func uploadFile(ctx context.Context, e *environment, name, key string) error {
+	zapPath := zap.String("path", name)
+
+	file, err := os.Open(name)
+	if err != nil {
+		e.log.Error("failed to open file", zap.Error(err), zapPath)
+		return err
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			e.log.Error("failed to close file", zap.Error(err), zapPath)
+		}
+	}()
+
+	if _, err := e.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:          &e.S3Bucket,
+		Key:             &key,
+		Body:            file,
+		ContentEncoding: aws.String("application/octet-stream"),
+	}); err != nil {
+		e.log.Error("failed to upload file to S3", zap.Error(err), zapPath)
 		return err
 	}
 
-	if err := watcher.Add(string(w.Directory)); err != nil {
-		log.Error("failed to add listener", zap.Error(err), zap.String("directory", string(w.Directory)))
+	return nil
+}
+
+func fileURL(e *environment, key string) string {
+	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", e.S3Bucket, e.Region, key)
+}
+
+func processLog(ctx context.Context, e *environment, w *watch, name string) {
+	zapPath := zap.String("path", name)
+
+	key, err := generateKey(e, name)
+	if err != nil {
+		e.log.Error("failed to generate S3 key", zap.Error(err), zapPath)
+		return
+	}
+
+	if err := uploadFile(ctx, e, name, key); err != nil {
+		return
+	}
+
+	finfo, err := os.Stat(name)
+	if err != nil {
+		e.log.Error("failed to stat file", zap.Error(err), zapPath)
+		return
+	}
+
+	e.cwlogsClient.PutLogEvents(ctx, &cwlogs.PutLogEventsInput{
+		LogEvents: []cwlt.InputLogEvent{
+			cwlt.InputLogEvent{
+				Message:   aws.String(fmt.Sprintf("New log file created. URL: %s", fileURL(e, key))),
+				Timestamp: aws.Int64(finfo.ModTime().Unix()),
+			},
+		},
+		LogGroupName:  aws.String(w.LogGroup),
+		LogStreamName: aws.String(w.LogStream),
+		SequenceToken: aws.String("dummy"),
+	})
+}
+
+func watchLogs(ctx context.Context, e *environment) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		e.log.Error("failed to watch", zap.Error(err))
 		return err
+	}
+
+	for _, w := range e.Watches {
+		if err := watcher.Add(string(w.Directory)); err != nil {
+			e.log.Error("failed to add listener", zap.Error(err), zap.String("directory", string(w.Directory)))
+			return err
+		}
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			e.log.Debug("done by signal")
 			return nil
+		case err := <-watcher.Errors:
+			e.log.Error("error", zap.Error(err))
+			return err
 		case ev := <-watcher.Events:
-			if ev.Op|fsnotify.Write != 0 {
-
+			switch ev.Op {
+			case fsnotify.CloseWrite, fsnotify.MoveTo:
+				w, err := e.wMap.get(ev.Name)
+				if err != nil {
+					e.log.Error("failed to find watch", zap.String("path", ev.Name))
+					continue
+				}
+				go processLog(ctx, e, w, ev.Name)
 			}
 		}
-	}
-}
-
-func watchLogs(ctx context.Context, cfg *config) {
-	for _, w := range cfg.Watches {
-		go watchLog(ctx, w)
 	}
 }

@@ -17,11 +17,11 @@ jobs:
     - uses: actions/setup-go@v2
       with:
         go-version: '^1.15.2'
-    - run: go build -o work/nudged .
+    - run: go build -o work/filelog .
     - uses: actions/upload-artifact@v2
       with:
         name: artifact
-        path: work/nudged
+        path: work/filelog
 
   release:
     needs: build
@@ -52,6 +52,6 @@ jobs:
         GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
       with:
         upload_url: ${{steps.create_release.outputs.upload_url}}
-        asset_path: ./nudged
-        asset_name: nudged.build-${{env.BUILD_NUMBER}}-linux-amd64
+        asset_path: ./filelog
+        asset_name: filelog.build-${{env.BUILD_NUMBER}}-linux-amd64
         asset_content_type: application/octet-stream
