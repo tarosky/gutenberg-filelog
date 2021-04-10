@@ -25,7 +25,10 @@ import (
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
 )
+
+const retryCount = 3
 
 // This implements zapcore.WriteSyncer interface.
 type lockedFileWriteSyncer struct {
@@ -133,14 +136,14 @@ func createLogger(ctx context.Context, logPath, errorLogPath AbsolutePath) *zap.
 		zap.WithCaller(false))
 }
 
-func setPIDFile(path string) func() {
+func setPIDFile(e *environment, path string) func() {
 	if path == "" {
 		return func() {}
 	}
 
 	pid := []byte(strconv.Itoa(os.Getpid()))
 	if err := ioutil.WriteFile(path, pid, 0644); err != nil {
-		log.Panic(
+		e.log.Panic(
 			"failed to create PID file",
 			zap.String("path", path),
 			zap.Error(err))
@@ -148,7 +151,7 @@ func setPIDFile(path string) func() {
 
 	return func() {
 		if err := os.Remove(path); err != nil {
-			log.Error(
+			e.log.Error(
 				"failed to remove PID file",
 				zap.String("path", path),
 				zap.Error(err))
@@ -174,10 +177,45 @@ func (p *AbsolutePath) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type sequenceToken struct {
+	token *string
+	mux   sync.Mutex
+}
+
+func (t *sequenceToken) retriableExclusive(retryCount int, fn func(*string, func(*string), func(*string))) error {
+	t.mux.Lock()
+	defer t.mux.Unlock()
+
+	retry := true
+	rc := retryCount
+
+	update := func(token *string) {
+		t.token = token
+	}
+
+	retryWithUpdate := func(token *string) {
+		update(token)
+		retry = true
+		rc--
+	}
+
+	for retry && 0 <= rc {
+		retry = false
+		fn(t.token, update, retryWithUpdate)
+	}
+
+	if retry {
+		return fmt.Errorf("retry loop count exceeded: %d", rc)
+	}
+
+	return nil
+}
+
 type watch struct {
-	Directory AbsolutePath `json:"directory"`
-	LogGroup  string       `json:"loggroup"`
-	LogStream string       `json:"logstream"`
+	Directory     AbsolutePath `json:"directory"`
+	LogGroup      string       `json:"loggroup"`
+	LogStream     string       `json:"logstream"`
+	sequenceToken *sequenceToken
 }
 
 type configure struct {
@@ -292,16 +330,16 @@ func main() {
 		defer e.log.Sync()
 
 		wMap := newWatchMap()
-		for _, w := range cfg.Watches {
-			w := w
-			if err := wMap.add(&w); err != nil {
+		for i := range cfg.Watches {
+			w := &cfg.Watches[i]
+			if err := wMap.add(w); err != nil {
 				e.log.Panic("failed to add", zap.String("directory", string(w.Directory)))
 			}
 		}
 
 		e.wMap = wMap
 
-		removePIDFile := setPIDFile(string(cfg.PIDPath))
+		removePIDFile := setPIDFile(e, string(cfg.PIDPath))
 		defer removePIDFile()
 
 		sig := make(chan os.Signal)
@@ -388,27 +426,126 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 		return
 	}
 
-	e.cwlogsClient.PutLogEvents(ctx, &cwlogs.PutLogEventsInput{
-		LogEvents: []cwlt.InputLogEvent{
-			cwlt.InputLogEvent{
-				Message:   aws.String(fmt.Sprintf("New log file created. URL: %s", fileURL(e, key))),
-				Timestamp: aws.Int64(finfo.ModTime().Unix()),
-			},
+	if err := w.sequenceToken.retriableExclusive(
+		retryCount,
+		func(token *string, updateToken func(*string), retryWithUpdate func(*string)) {
+			res, err := e.cwlogsClient.PutLogEvents(ctx, &cwlogs.PutLogEventsInput{
+				LogEvents: []cwlt.InputLogEvent{
+					{
+						Message:   aws.String(fmt.Sprintf("New log file created. URL: %s", fileURL(e, key))),
+						Timestamp: aws.Int64(finfo.ModTime().Unix()),
+					},
+				},
+				LogGroupName:  aws.String(w.LogGroup),
+				LogStreamName: aws.String(w.LogStream),
+				SequenceToken: token,
+			})
+			if err != nil {
+				var alreadyAcceptedError *cwlt.DataAlreadyAcceptedException
+				if errors.As(err, &alreadyAcceptedError) {
+					e.log.Warn("found already accepted log", zap.Error(err), zapPath)
+					return
+				}
+
+				var invalidTokenError *cwlt.InvalidSequenceTokenException
+				if errors.As(err, &invalidTokenError) {
+					retryWithUpdate(invalidTokenError.ExpectedSequenceToken)
+					e.log.Warn("sequence token is invalid, corrected", zap.Error(err), zapPath)
+					return
+				}
+
+				e.log.Error("error while putting log event", zap.Error(err), zapPath)
+				return
+			}
+
+			updateToken(res.NextSequenceToken)
+
+			if res.RejectedLogEventsInfo != nil {
+				var reason string
+				if res.RejectedLogEventsInfo.ExpiredLogEventEndIndex != nil {
+					reason = "already expired time"
+				} else if res.RejectedLogEventsInfo.TooNewLogEventStartIndex != nil {
+					reason = "time too new"
+				} else if res.RejectedLogEventsInfo.TooOldLogEventEndIndex != nil {
+					reason = "time too old"
+				}
+				e.log.Error("log rejected", zapPath, zap.String("reason", reason))
+				return
+			}
+
+			return
 		},
-		LogGroupName:  aws.String(w.LogGroup),
-		LogStreamName: aws.String(w.LogStream),
-		SequenceToken: aws.String("dummy"),
-	})
+	); err != nil {
+		e.log.Error("retrying putting log event failed", zap.Error(err), zapPath)
+	}
+}
+
+func ensureLogStreams(ctx context.Context, e *environment) error {
+	group, ctx := errgroup.WithContext(ctx)
+
+	for i := range e.Watches {
+		w := &e.Watches[i]
+
+		logData := func(err error) []zapcore.Field {
+			return []zapcore.Field{
+				zap.Error(err),
+				zap.String("log-stream", w.LogStream),
+				zap.String("log-group", w.LogGroup),
+			}
+		}
+
+		group.Go(func() error {
+			if _, err := e.cwlogsClient.CreateLogStream(ctx, &cwlogs.CreateLogStreamInput{
+				LogGroupName:  &w.LogGroup,
+				LogStreamName: &w.LogStream,
+			}); err != nil {
+				var existsError *cwlt.ResourceAlreadyExistsException
+				if errors.As(err, &existsError) {
+					res, err := e.cwlogsClient.DescribeLogStreams(ctx, &cwlogs.DescribeLogStreamsInput{
+						LogGroupName:        &w.LogGroup,
+						Limit:               aws.Int32(1),
+						LogStreamNamePrefix: &w.LogStream,
+					})
+					if err != nil {
+						e.log.Error("failed to describe log stream", logData(err)...)
+						return err
+					}
+
+					if len(res.LogStreams) != 1 {
+						err := fmt.Errorf("unexpected log stream count: %d", len(res.LogStreams))
+						e.log.Error("failed to describe log stream",
+							logData(err)...)
+						return err
+					}
+
+					w.sequenceToken.token = res.LogStreams[0].UploadSequenceToken
+					return nil
+				}
+
+				e.log.Error("failed to create log stream", logData(err)...)
+				return err
+			}
+
+			return nil
+		})
+	}
+
+	return group.Wait()
 }
 
 func watchLogs(ctx context.Context, e *environment) error {
+	if err := ensureLogStreams(ctx, e); err != nil {
+		return err
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		e.log.Error("failed to watch", zap.Error(err))
 		return err
 	}
 
-	for _, w := range e.Watches {
+	for i := range e.Watches {
+		w := &e.Watches[i]
 		if err := watcher.Add(string(w.Directory)); err != nil {
 			e.log.Error("failed to add listener", zap.Error(err), zap.String("directory", string(w.Directory)))
 			return err
