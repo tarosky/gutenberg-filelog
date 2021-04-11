@@ -332,6 +332,7 @@ func main() {
 		wMap := newWatchMap()
 		for i := range cfg.Watches {
 			w := &cfg.Watches[i]
+			w.sequenceToken = &sequenceToken{}
 			if err := wMap.add(w); err != nil {
 				e.log.Panic("failed to add", zap.String("directory", string(w.Directory)))
 			}
@@ -400,6 +401,16 @@ func uploadFile(ctx context.Context, e *environment, name, key string) error {
 		return err
 	}
 
+	// if _, err := e.s3Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
+	// 	Bucket: &e.S3Bucket,
+	// 	Key:    &key,
+	// 	ACL:    s3t.ObjectCannedACLPublicRead,
+	// }); err != nil {
+	// 	e.log.Error("failed to make uploaded file public", zap.Error(err), zapPath)
+	// 	return err
+	// }
+
+	e.log.Debug("file uploaded to S3", zapPath)
 	return nil
 }
 
@@ -433,7 +444,7 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 				LogEvents: []cwlt.InputLogEvent{
 					{
 						Message:   aws.String(fmt.Sprintf("New log file created. URL: %s", fileURL(e, key))),
-						Timestamp: aws.Int64(finfo.ModTime().Unix()),
+						Timestamp: aws.Int64(finfo.ModTime().UnixNano() / 1000000),
 					},
 				},
 				LogGroupName:  aws.String(w.LogGroup),
@@ -473,6 +484,7 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 				return
 			}
 
+			e.log.Debug("log event uploaded", zapPath)
 			return
 		},
 	); err != nil {
@@ -501,6 +513,7 @@ func ensureLogStreams(ctx context.Context, e *environment) error {
 			}); err != nil {
 				var existsError *cwlt.ResourceAlreadyExistsException
 				if errors.As(err, &existsError) {
+					e.log.Debug("log stream found", logData(err)...)
 					res, err := e.cwlogsClient.DescribeLogStreams(ctx, &cwlogs.DescribeLogStreamsInput{
 						LogGroupName:        &w.LogGroup,
 						Limit:               aws.Int32(1),
@@ -526,6 +539,9 @@ func ensureLogStreams(ctx context.Context, e *environment) error {
 				return err
 			}
 
+			e.log.Debug("new log stream created",
+				zap.String("log-stream", w.LogStream),
+				zap.String("log-group", w.LogGroup))
 			return nil
 		})
 	}
@@ -544,8 +560,7 @@ func watchLogs(ctx context.Context, e *environment) error {
 		return err
 	}
 
-	for i := range e.Watches {
-		w := &e.Watches[i]
+	for _, w := range e.Watches {
 		if err := watcher.Add(string(w.Directory)); err != nil {
 			e.log.Error("failed to add listener", zap.Error(err), zap.String("directory", string(w.Directory)))
 			return err

@@ -1,0 +1,15 @@
+{
+  "region": "ap-northeast-1",
+  "s3bucket": "tarosky-lab-harai",
+  "s3keyprefix": "gutenberg-filelog/",
+  "logpath": "test/work/filelog.log",
+  "errorlogpath": "test/work/filelog-error.log",
+  "pidpath": "test/work/filelog.pid",
+  "watches": [
+    {
+      "directory": "test/work/mylog",
+      "loggroup": "tarosky-guteneberg-filelog-dev",
+      "logstream": "teststream"
+    }
+  ]
+}
