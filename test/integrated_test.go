@@ -2,7 +2,11 @@ package test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -10,12 +14,14 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/unix"
 )
 
 const (
+	configPath          = "work/config.json"
 	testLogDir1         = "work/test-log-dir-1"
 	testLogDir2         = "work/test-log-dir-2"
 	filelogLogPath      = "work/filelog.log"
@@ -69,24 +75,45 @@ func readTestConfig(name string) string {
 	return strings.TrimSpace(string(val))
 }
 
+type jsonDict map[string]interface{}
+type jsonArray []interface{}
+
 func generateConfig() {
-	f = map[string]interface{}{
+	bs := [8]byte{}
+	if _, err := rand.Read(bs[:]); err != nil {
+		panic(err)
+	}
+
+	stream := time.Now().Format("2006-01-02T150405-0700") + "-" + hex.EncodeToString(bs[:])
+	cfg := jsonDict{
 		"region":       "ap-northeast-1",
 		"s3bucket":     readTestConfig("s3-bucket"),
 		"s3keyprefix":  "gutenberg-filelog/",
 		"logpath":      filelogLogPath,
 		"errorlogpath": filelogErrorLogPath,
 		"pidpath":      filelogPIDPath,
-		"watches": []interface{}{
-			map[string]interface{}{
+		"watches": jsonArray{
+			jsonDict{
 				"directory": testLogDir1,
-				"loggroup":  "tarosky-guteneberg-filelog-dev",
-				"logstream": "teststream",
+				"loggroup":  readTestConfig("test-log-group-1"),
+				"logstream": stream,
 			},
-			"Morticia",
+			jsonDict{
+				"directory": testLogDir2,
+				"loggroup":  readTestConfig("test-log-group-2"),
+				"logstream": stream,
+			},
 		},
 	}
 
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := ioutil.WriteFile(configPath, cfgJSON, 0644); err != nil {
+		panic(err)
+	}
 }
 
 func initTestSuite() *TestSuite {
@@ -102,6 +129,8 @@ type TestSuite struct {
 	suite.Suite
 	ctx     context.Context
 	process *os.Process
+	stdout  io.Writer
+	stderr  io.Writer
 }
 
 func TestFileLogSuite(t *testing.T) {
@@ -116,10 +145,24 @@ func (s *TestSuite) SetupTest() {
 	s.Require().NoError(os.RemoveAll(testLogDir2))
 	s.Require().NoError(os.MkdirAll(testLogDir1, 0755))
 	s.Require().NoError(os.MkdirAll(testLogDir2, 0755))
-	cmd := exec.CommandContext(s.ctx, "work/filelog", "-f", "work/config.json")
+
+	cmd := exec.CommandContext(s.ctx, "work/filelog", "-f", configPath)
 	cmd.Env = []string{
 		fmt.Sprintf("AWS_ACCESS_KEY_ID=%s", readTestConfig("access-key-id")),
 		fmt.Sprintf("AWS_SECRET_ACCESS_KEY=%s", readTestConfig("secret-access-key")),
+		fmt.Sprintf("AWS_ACCOUNT_ID=%s", readTestConfig("aws-account-id")),
+	}
+	{
+		var err error
+		s.stdout, err = os.OpenFile("work/stdout.log", os.O_WRONLY|os.O_CREATE, 0644)
+		s.Assert().NoError(err)
+		cmd.Stdout = s.stdout
+	}
+	{
+		var err error
+		s.stderr, err = os.OpenFile("work/stderr.log", os.O_WRONLY|os.O_CREATE, 0644)
+		s.Assert().NoError(err)
+		cmd.Stderr = s.stderr
 	}
 	s.Require().NoError(cmd.Start())
 	s.process = cmd.Process
@@ -132,4 +175,9 @@ func (s *TestSuite) TearDownTest() {
 		s.Require().NoError(err)
 	}
 	s.Require().Equal(0, state.ExitCode())
+}
+
+func (s *TestSuite) Test_DoNothing() {
+	s.Assert().True(true)
+	time.Sleep(time.Second)
 }

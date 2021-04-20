@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
+	"math/big"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -225,6 +227,7 @@ type configure struct {
 	LogPath      AbsolutePath `json:"logpath"`
 	ErrorLogPath AbsolutePath `json:"errorlogpath"`
 	PIDPath      AbsolutePath `json:"pidpath"`
+	ZipCommand   string       `json:"zipcommand,omitempty"`
 	Watches      []watch      `json:"watches"`
 }
 
@@ -286,8 +289,6 @@ func main() {
 	}
 
 	app.Action = func(c *cli.Context) error {
-		defer panic("debugging")
-
 		mustGetAbsPath := func(name string) string {
 			path, err := filepath.Abs(c.Path(name))
 			if err != nil {
@@ -310,7 +311,9 @@ func main() {
 			panic(err)
 		}
 
-		cfg := &configure{}
+		cfg := &configure{
+      ZipCommand: "zip",
+    }
 		if err := json.Unmarshal(configData, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "malformed config file: %s", err.Error())
 			panic(err)
@@ -375,6 +378,28 @@ func generateKey(e *environment, name string) (string, error) {
 	dir := hex.EncodeToString(bs[:])
 
 	return e.S3KeyPrefix + dir + "/" + fileName, nil
+}
+
+func generatePassword() (string, error) {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+	const letterLen = len(letters)
+	const passwordLen = 12
+
+	var bs [passwordLen]byte
+	for i := 0; i < passwordLen; i++ {
+		bi, err := rand.Int(rand.Reader, big.NewInt(int64(letterLen)))
+		if err != nil {
+			return "", err
+		}
+		bs[i] = letters[bi.Int64()]
+	}
+
+	return string(bs[:]), nil
+}
+
+func zipFile(e *environment, name, password, outputName string) (string, error) {
+  cmd := exec.Command(e.ZipCommand, "-P", password, outputName, name)
+  cmd.
 }
 
 func uploadFile(ctx context.Context, e *environment, name, key string) error {
