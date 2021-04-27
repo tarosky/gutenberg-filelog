@@ -7,3 +7,8 @@ insert_final_newline = true
 indent_style = space
 # Support deep nest.
 indent_size = 2
+
+[*.go]
+# https://golang.org/doc/effective_go.html
+indent_style = tab
+indent_size = 4

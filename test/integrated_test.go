@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -16,6 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	cwlogs "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/unix"
 )
@@ -27,6 +32,11 @@ const (
 	filelogLogPath      = "work/filelog.log"
 	filelogErrorLogPath = "work/filelog-error.log"
 	filelogPIDPath      = "work/filelog.pid"
+)
+
+var (
+	testLogGroup1 string
+	testLogGroup2 string
 )
 
 // fixWorkDir moves working directory to project root directory.
@@ -46,16 +56,8 @@ func buildFileLog() {
 		panic(err)
 	}
 
-	if err := os.Chdir(path.Dir(curr)); err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := os.Chdir(curr); err != nil {
-			panic(err)
-		}
-	}()
-
 	cmd := exec.Command("go", "build", "-o", "test/work/filelog", ".")
+	cmd.Dir = path.Dir(curr)
 	if err := cmd.Run(); err != nil {
 		panic(err)
 	}
@@ -78,13 +80,30 @@ func readTestConfig(name string) string {
 type jsonDict map[string]interface{}
 type jsonArray []interface{}
 
-func generateConfig() {
+func createAWSConfig(ctx context.Context) *aws.Config {
+	awsCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("ap-northeast-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			readTestConfig("access-key-id"),
+			readTestConfig("secret-access-key"),
+			"")))
+	if err != nil {
+		panic(err)
+	}
+
+	return &awsCfg
+}
+
+func generateStreamName() string {
 	bs := [8]byte{}
 	if _, err := rand.Read(bs[:]); err != nil {
 		panic(err)
 	}
 
-	stream := time.Now().Format("2006-01-02T150405-0700") + "-" + hex.EncodeToString(bs[:])
+	return time.Now().Format("2006-01-02T150405-0700") + "-" + hex.EncodeToString(bs[:])
+}
+
+func generateConfig(stream string) {
 	cfg := jsonDict{
 		"region":       "ap-northeast-1",
 		"s3bucket":     readTestConfig("s3-bucket"),
@@ -95,12 +114,12 @@ func generateConfig() {
 		"watches": jsonArray{
 			jsonDict{
 				"directory": testLogDir1,
-				"loggroup":  readTestConfig("test-log-group-1"),
+				"loggroup":  testLogGroup1,
 				"logstream": stream,
 			},
 			jsonDict{
 				"directory": testLogDir2,
-				"loggroup":  readTestConfig("test-log-group-2"),
+				"loggroup":  testLogGroup2,
 				"logstream": stream,
 			},
 		},
@@ -119,18 +138,33 @@ func generateConfig() {
 func initTestSuite() *TestSuite {
 	fixWorkDir()
 	buildFileLog()
-	generateConfig()
+	stream := generateStreamName()
 
-	return &TestSuite{ctx: context.Background()}
+	testLogGroup1 = readTestConfig("test-log-group-1")
+	testLogGroup2 = readTestConfig("test-log-group-2")
+
+	generateConfig(stream)
+	ctx := context.Background()
+	awsConfig := createAWSConfig(ctx)
+
+	return &TestSuite{
+		ctx:          ctx,
+		logStream:    stream,
+		awsConfig:    awsConfig,
+		cwlogsClient: cwlogs.NewFromConfig(*awsConfig),
+	}
 }
 
 // TestSuite holds configs and sessions required to execute program.
 type TestSuite struct {
 	suite.Suite
-	ctx     context.Context
-	process *os.Process
-	stdout  io.Writer
-	stderr  io.Writer
+	ctx          context.Context
+	logStream    string
+	awsConfig    *aws.Config
+	cwlogsClient *cwlogs.Client
+	process      *os.Process
+	stdout       io.Writer
+	stderr       io.Writer
 }
 
 func TestFileLogSuite(t *testing.T) {
@@ -180,4 +214,56 @@ func (s *TestSuite) TearDownTest() {
 func (s *TestSuite) Test_DoNothing() {
 	s.Assert().True(true)
 	time.Sleep(time.Second)
+}
+
+func (s *TestSuite) Test_LogFileUploaded() {
+	startTime := time.Now().UnixNano() / 1_000_000
+
+	time.Sleep(2 * time.Second)
+
+	logPath := testLogDir1 + "/test.log"
+	file, err := os.Create(logPath)
+	s.Require().NoError(err)
+	file.Write([]byte("hoge"))
+	file.Sync()
+	file.Write([]byte("hoge"))
+	s.Require().NoError(file.Close())
+
+	time.Sleep(10 * time.Second)
+
+	res, err := s.cwlogsClient.GetLogEvents(s.ctx, &cwlogs.GetLogEventsInput{
+		LogGroupName:  aws.String(testLogGroup1),
+		LogStreamName: aws.String(s.logStream),
+		StartTime:     aws.Int64(startTime),
+		Limit:         aws.Int32(10),
+	})
+	s.Require().NoError(err)
+	s.Assert().Equal(1, len(res.Events))
+	logEvent := map[string]string{}
+	s.Assert().NoError(json.Unmarshal([]byte(*res.Events[0].Message), &logEvent))
+	res2, err := http.Get(logEvent["url"])
+	s.Assert().NoError(err)
+
+	tempDir, err := ioutil.TempDir("", "")
+	s.Require().NoError(err)
+	defer func() {
+		s.Require().NoError(os.RemoveAll(tempDir))
+	}()
+
+	downloadedLogPath := tempDir + "/log.zip"
+	file2, err := os.Create(downloadedLogPath)
+	s.Require().NoError(err)
+	_, err = io.Copy(file2, res2.Body)
+	s.Require().NoError(err)
+	s.Require().NoError(file2.Close())
+
+	cmd := exec.CommandContext(s.ctx, "unzip", "-P", logEvent["password"], downloadedLogPath)
+	cmd.Dir = tempDir
+	s.Require().NoError(cmd.Run())
+	content, err := ioutil.ReadFile(tempDir + "/test.log")
+	s.Assert().NoError(err)
+	s.Require().Equal("hogehoge", string(content))
+
+	_, err = os.Stat(logPath)
+	s.Assert().Error(err)
 }

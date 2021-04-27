@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -312,8 +314,8 @@ func main() {
 		}
 
 		cfg := &configure{
-      ZipCommand: "zip",
-    }
+			ZipCommand: "/usr/bin/zip",
+		}
 		if err := json.Unmarshal(configData, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "malformed config file: %s", err.Error())
 			panic(err)
@@ -397,9 +399,47 @@ func generatePassword() (string, error) {
 	return string(bs[:]), nil
 }
 
-func zipFile(e *environment, name, password, outputName string) (string, error) {
-  cmd := exec.Command(e.ZipCommand, "-P", password, outputName, name)
-  cmd.
+func zipFile(e *environment, name, password string) (string, func(), error) {
+	zapPath := zap.String("path", name)
+
+	tempName, err := ioutil.TempDir("", "")
+	if err != nil {
+		e.log.Error("failed to create temp dir for zipping", zap.Error(err), zapPath)
+		return "", nil, err
+	}
+	closeTemp := func() {
+		if err := os.RemoveAll(tempName); err != nil {
+			e.log.Error("failed to close temp dir", zap.Error(err), zapPath)
+		}
+	}
+
+	fileName := path.Base(name)
+	outputPath := fmt.Sprintf("%s/%s.zip", tempName, fileName)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	cmd := exec.Command(e.ZipCommand, "-P", password, outputPath, fileName)
+	cmd.Dir = path.Dir(name)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	if err := cmd.Run(); err != nil {
+		e.log.Error("failed to create zipped file",
+			zap.Error(err),
+			zapPath,
+			zap.String("command", cmd.String()),
+			zap.String("stdout", stdout.String()),
+			zap.String("stderr", stderr.String()))
+		closeTemp()
+		return "", nil, err
+	}
+
+	e.log.Debug("zipped",
+		zapPath,
+		zap.String("stdout", stdout.String()),
+		zap.String("stderr", stderr.String()))
+	return outputPath, closeTemp, nil
 }
 
 func uploadFile(ctx context.Context, e *environment, name, key string) error {
@@ -446,13 +486,27 @@ func fileURL(e *environment, key string) string {
 func processLog(ctx context.Context, e *environment, w *watch, name string) {
 	zapPath := zap.String("path", name)
 
-	key, err := generateKey(e, name)
+	password, err := generatePassword()
+	if err != nil {
+		e.log.Error("failed to generate zip password", zap.Error(err), zapPath)
+		return
+	}
+
+	zipPath, close, err := zipFile(e, name, password)
+	if err != nil {
+		e.log.Error("failed to create zip file", zap.Error(err), zapPath)
+		return
+	}
+	defer close()
+
+	key, err := generateKey(e, zipPath)
 	if err != nil {
 		e.log.Error("failed to generate S3 key", zap.Error(err), zapPath)
 		return
 	}
 
-	if err := uploadFile(ctx, e, name, key); err != nil {
+	if err := uploadFile(ctx, e, zipPath, key); err != nil {
+		e.log.Error("failed to upload file", zap.Error(err), zapPath)
 		return
 	}
 
@@ -462,14 +516,24 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 		return
 	}
 
+	message, err := json.Marshal(map[string]string{
+		"message":  "new log file",
+		"url":      fileURL(e, key),
+		"password": password,
+	})
+	if err != nil {
+		e.log.Error("failed to construct message", zap.Error(err), zapPath)
+		return
+	}
+
 	if err := w.sequenceToken.retriableExclusive(
 		retryCount,
 		func(token *string, updateToken func(*string), retryWithUpdate func(*string)) {
 			res, err := e.cwlogsClient.PutLogEvents(ctx, &cwlogs.PutLogEventsInput{
 				LogEvents: []cwlt.InputLogEvent{
 					{
-						Message:   aws.String(fmt.Sprintf("New log file created. URL: %s", fileURL(e, key))),
-						Timestamp: aws.Int64(finfo.ModTime().UnixNano() / 1000000),
+						Message:   aws.String(string(message)),
+						Timestamp: aws.Int64(finfo.ModTime().UnixNano() / 1_000_000),
 					},
 				},
 				LogGroupName:  aws.String(w.LogGroup),
@@ -514,6 +578,10 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 		},
 	); err != nil {
 		e.log.Error("retrying putting log event failed", zap.Error(err), zapPath)
+	}
+
+	if err := os.Remove(name); err != nil {
+		e.log.Error("failed to remove uploaded file", zap.Error(err), zapPath)
 	}
 }
 
