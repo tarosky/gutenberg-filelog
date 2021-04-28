@@ -466,15 +466,6 @@ func uploadFile(ctx context.Context, e *environment, name, key string) error {
 		return err
 	}
 
-	// if _, err := e.s3Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
-	// 	Bucket: &e.S3Bucket,
-	// 	Key:    &key,
-	// 	ACL:    s3t.ObjectCannedACLPublicRead,
-	// }); err != nil {
-	// 	e.log.Error("failed to make uploaded file public", zap.Error(err), zapPath)
-	// 	return err
-	// }
-
 	e.log.Debug("file uploaded to S3", zapPath)
 	return nil
 }
