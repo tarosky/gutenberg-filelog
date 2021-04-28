@@ -57,7 +57,7 @@ jobs:
       if: always()
       with:
         github_token: ${{secrets.GITHUB_TOKEN}}
-        files: work/report.xml
+        files: test/work/report.xml
 
   release:
     needs:
