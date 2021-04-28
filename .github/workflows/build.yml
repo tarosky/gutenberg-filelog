@@ -53,7 +53,7 @@ jobs:
     - run: go test -v . 2>&1 | tee work/test.log
     - run: go-junit-report < work/test.log | tee work/report.xml
     - name: Publish Unit Test Results
-      uses: EnricoMi/publish-unit-test-result-action@v1.6
+      uses: EnricoMi/publish-unit-test-result-action@v1
       if: always()
       with:
         github_token: ${{secrets.GITHUB_TOKEN}}
