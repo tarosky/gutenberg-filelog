@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -70,7 +69,7 @@ func readTestConfig(name string) string {
 	}
 
 	path := cwd + "/config/" + name
-	val, err := ioutil.ReadFile(path)
+	val, err := os.ReadFile(path)
 	if err != nil {
 		panic("failed to load config file: " + path + ", error: " + err.Error())
 	}
@@ -130,7 +129,7 @@ func generateConfig(stream string) {
 		panic(err)
 	}
 
-	if err := ioutil.WriteFile(configPath, cfgJSON, 0644); err != nil {
+	if err := os.WriteFile(configPath, cfgJSON, 0644); err != nil {
 		panic(err)
 	}
 }
@@ -244,7 +243,7 @@ func (s *TestSuite) Test_LogFileUploaded() {
 	res2, err := http.Get(logEvent["url"])
 	s.Assert().NoError(err)
 
-	tempDir, err := ioutil.TempDir("", "")
+	tempDir, err := os.MkdirTemp("", "")
 	s.Require().NoError(err)
 	defer func() {
 		s.Require().NoError(os.RemoveAll(tempDir))
@@ -260,7 +259,7 @@ func (s *TestSuite) Test_LogFileUploaded() {
 	cmd := exec.CommandContext(s.ctx, "unzip", "-P", logEvent["password"], downloadedLogPath)
 	cmd.Dir = tempDir
 	s.Require().NoError(cmd.Run())
-	content, err := ioutil.ReadFile(tempDir + "/test.log")
+	content, err := os.ReadFile(tempDir + "/test.log")
 	s.Assert().NoError(err)
 	s.Require().Equal("hogehoge", string(content))
 

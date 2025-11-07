@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	stdlog "log"
 	"math/big"
 	"os"
@@ -117,18 +117,19 @@ func createLogger(ctx context.Context, logPath, errorLogPath AbsolutePath) *zap.
 	signal.Notify(sigusr1, syscall.SIGUSR1)
 
 	go func() {
+	outer:
 		for {
 			select {
 			case _, ok := <-sigusr1:
 				if !ok {
-					break
+					break outer
 				}
 				out.reopen()
 				errOut.reopen()
 			case <-ctx.Done():
 				signal.Stop(sigusr1)
 				// closing sigusr1 causes panic (close of closed channel)
-				break
+				break outer
 			}
 		}
 	}()
@@ -146,7 +147,7 @@ func setPIDFile(e *environment, path string) func() {
 	}
 
 	pid := []byte(strconv.Itoa(os.Getpid()))
-	if err := ioutil.WriteFile(path, pid, 0644); err != nil {
+	if err := os.WriteFile(path, pid, 0644); err != nil {
 		e.log.Panic(
 			"failed to create PID file",
 			zap.String("path", path),
@@ -307,7 +308,7 @@ func main() {
 			panic(err)
 		}
 
-		configData, err := ioutil.ReadAll(file)
+		configData, err := io.ReadAll(file)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to read config data: %s", err.Error())
 			panic(err)
@@ -348,8 +349,8 @@ func main() {
 		removePIDFile := setPIDFile(e, string(cfg.PIDPath))
 		defer removePIDFile()
 
-		sig := make(chan os.Signal)
-		signal.Notify(sig, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGQUIT)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 		go func() {
 			defer func() {
 				signal.Stop(sig)
@@ -388,7 +389,7 @@ func generatePassword() (string, error) {
 	const passwordLen = 12
 
 	var bs [passwordLen]byte
-	for i := 0; i < passwordLen; i++ {
+	for i := range passwordLen {
 		bi, err := rand.Int(rand.Reader, big.NewInt(int64(letterLen)))
 		if err != nil {
 			return "", err
@@ -402,7 +403,7 @@ func generatePassword() (string, error) {
 func zipFile(e *environment, name, password string) (string, func(), error) {
 	zapPath := zap.String("path", name)
 
-	tempName, err := ioutil.TempDir("", "")
+	tempName, err := os.MkdirTemp("", "")
 	if err != nil {
 		e.log.Error("failed to create temp dir for zipping", zap.Error(err), zapPath)
 		return "", nil, err
@@ -565,7 +566,6 @@ func processLog(ctx context.Context, e *environment, w *watch, name string) {
 			}
 
 			e.log.Debug("log event uploaded", zapPath)
-			return
 		},
 	); err != nil {
 		e.log.Error("retrying putting log event failed", zap.Error(err), zapPath)
