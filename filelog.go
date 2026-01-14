@@ -25,6 +25,7 @@ import (
 	cwlogs "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwlt "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/coreos/go-systemd/daemon"
 	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
@@ -650,6 +651,8 @@ func watchLogs(ctx context.Context, e *environment) error {
 			return err
 		}
 	}
+
+	_, _ = daemon.SdNotify(false, daemon.SdNotifyReady)
 
 	for {
 		select {
