@@ -3,15 +3,15 @@ name: CI
 on:
   pull_request:
     branches:
-    - master
+      - master
   push:
     branches:
-    - master
-    - issue/*
+      - master
+      - issue/*
 
 env:
   ACCESS_KEY_ID: AKIAQGFE5ESVLHKU7RDF
-  AWS_ACCOUNT_ID: '013230744746'
+  AWS_ACCOUNT_ID: "013230744746"
   S3_BUCKET: gutenberg-filelogtest-testbucket-1u75zaoui85be
   TEST_LOG_GROUP_1: gutenberg-filelogtest-TestLogGroup1-EdDW6zftTSK4
   TEST_LOG_GROUP_2: gutenberg-filelogtest-TestLogGroup2-SvaUY4F6TRSC
@@ -19,16 +19,32 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    container:
+      # Stick to older glibc for compatibility.
+      # Ref: https://tech.guitarrapc.com/entry/2025/04/02/235900
+      image: ubuntu:20.04
     steps:
-    - uses: actions/checkout@main
-    - uses: actions/setup-go@main
-      with:
-        go-version: '^1.25.3'
-    - run: go build -o work/filelog .
-    - uses: actions/upload-artifact@main
-      with:
-        name: artifact
-        path: work/filelog
+      # Workaround for error:
+      # error obtaining VCS status: exit status 128
+      #     Use -buildvcs=false to disable VCS stamping.
+      - run: chown root:root .
+      - name: Show glibc version
+        run: ldd --version
+      - name: apt-get
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y unzip curl git autoconf build-essential ca-certificates tzdata
+      - uses: actions/checkout@main
+      - uses: actions/setup-go@main
+        with:
+          go-version: "^1.25.3"
+      - run: go build -o work/filelog .
+      - uses: actions/upload-artifact@main
+        with:
+          name: artifact
+          path: work/filelog
 
   test:
     runs-on: ubuntu-24.04
@@ -36,57 +52,57 @@ jobs:
       run:
         working-directory: test
     steps:
-    - uses: actions/checkout@main
-    - uses: actions/setup-go@main
-      with:
-        go-version: '^1.25.3'
-    - run: echo "$ACCESS_KEY_ID" > config/access-key-id
-    - run: echo "$AWS_ACCOUNT_ID" > config/aws-account-id
-    - run: echo "$S3_BUCKET" > config/s3-bucket
-    - run: echo "$TEST_LOG_GROUP_1" > config/test-log-group-1
-    - run: echo "$TEST_LOG_GROUP_2" > config/test-log-group-2
-    - run: echo "$TEST_AWS_SECRET_ACCESS_KEY" > config/secret-access-key
-      env:
-        TEST_AWS_SECRET_ACCESS_KEY: ${{secrets.TEST_AWS_SECRET_ACCESS_KEY}}
-    - run: go install github.com/jstemmer/go-junit-report
-    - run: go test -v . 2>&1 | tee work/test.log
-    - run: go-junit-report < work/test.log | tee work/report.xml
-    - name: Publish Unit Test Results
-      uses: EnricoMi/publish-unit-test-result-action@master
-      if: always()
-      with:
-        github_token: ${{secrets.GITHUB_TOKEN}}
-        files: test/work/report.xml
+      - uses: actions/checkout@main
+      - uses: actions/setup-go@main
+        with:
+          go-version: "^1.25.3"
+      - run: echo "$ACCESS_KEY_ID" > config/access-key-id
+      - run: echo "$AWS_ACCOUNT_ID" > config/aws-account-id
+      - run: echo "$S3_BUCKET" > config/s3-bucket
+      - run: echo "$TEST_LOG_GROUP_1" > config/test-log-group-1
+      - run: echo "$TEST_LOG_GROUP_2" > config/test-log-group-2
+      - run: echo "$TEST_AWS_SECRET_ACCESS_KEY" > config/secret-access-key
+        env:
+          TEST_AWS_SECRET_ACCESS_KEY: ${{secrets.TEST_AWS_SECRET_ACCESS_KEY}}
+      - run: go install github.com/jstemmer/go-junit-report
+      - run: go test -v . 2>&1 | tee work/test.log
+      - run: go-junit-report < work/test.log | tee work/report.xml
+      - name: Publish Unit Test Results
+        uses: EnricoMi/publish-unit-test-result-action@master
+        if: always()
+        with:
+          github_token: ${{secrets.GITHUB_TOKEN}}
+          files: test/work/report.xml
 
   release:
     needs:
-    - build
-    - test
+      - build
+      - test
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     env:
       # Workaround for https://github.com/github/vscode-github-actions/issues/222
       BUILD_NUMBER: ""
     steps:
-    - uses: actions/download-artifact@main
-      with:
-        name: artifact
-    - name: Generate build number
-      uses: onyxmueller/build-tag-number@main
-      with:
-        token: ${{secrets.GITHUB_TOKEN}}
-        prefix: build_number_generator
-    - name: Print new build number
-      run: echo "Build number is $BUILD_NUMBER"
-    - run: mv filelog filelog.build-${{env.BUILD_NUMBER}}-linux-amd64
-    - id: create_release
-      uses: softprops/action-gh-release@master
-      env:
-        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-      with:
-        tag_name: build-${{env.BUILD_NUMBER}}
-        name: Build ${{env.BUILD_NUMBER}}
-        draft: false
-        prerelease: false
-        files: |
-          filelog.*
+      - uses: actions/download-artifact@main
+        with:
+          name: artifact
+      - name: Generate build number
+        uses: onyxmueller/build-tag-number@main
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          prefix: build_number_generator
+      - name: Print new build number
+        run: echo "Build number is $BUILD_NUMBER"
+      - run: mv filelog filelog.build-${{env.BUILD_NUMBER}}-linux-amd64
+      - id: create_release
+        uses: softprops/action-gh-release@master
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        with:
+          tag_name: build-${{env.BUILD_NUMBER}}
+          name: Build ${{env.BUILD_NUMBER}}
+          draft: false
+          prerelease: false
+          files: |
+            filelog.*
